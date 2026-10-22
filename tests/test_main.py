@@ -54,6 +54,7 @@ def point_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     records = tmp_path / "records"
     records.mkdir()
     monkeypatch.setattr("app.config.SRC_DIR", records)
+    monkeypatch.setattr("app.config.DOWNLOAD_DIR", tmp_path / "download")
     monkeypatch.setattr("app.config.LOG_FILE", tmp_path / "archiver.log")
     monkeypatch.setattr("app.config.LOCK_PATH", tmp_path / "lock")
     monkeypatch.setattr("app.config.HEARTBEAT_PATH", tmp_path / "heartbeat")
@@ -198,6 +199,144 @@ def test_busy_lock_exits_without_secrets(
     assert "secret-test-value" not in text
     assert "AKIATESTKEY" not in text
     assert records.exists()
+
+
+@mock_aws
+def test_count_lists_prefix_without_changing_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import boto3
+
+    records = point_paths(monkeypatch, tmp_path)
+    fill_env(monkeypatch)
+    place_file(records, "keep.mp3", b"local", datetime.now(timezone.utc))
+    client = boto3.client("s3", region_name="us-east-1")
+    client.create_bucket(Bucket="recordings")
+    client.put_object(Bucket="recordings", Key="records/a.wav", Body=b"abc")
+    client.put_object(Bucket="recordings", Key="records/b.wav", Body=b"12345")
+    client.put_object(Bucket="recordings", Key="other/c.wav", Body=b"zz")
+
+    def fail_lock(path: Path) -> bool:
+        raise AssertionError(path)
+
+    monkeypatch.setattr("app.main.acquire_lock", fail_lock)
+    code = main(["--count"])
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert code == 0, text
+    assert "объектов=2" in text
+    assert "байт=8" in text
+    assert "префикс='records/'" in text
+    assert "бакет=recordings" in text
+    assert (records / "keep.mp3").exists()
+    assert "secret-test-value" not in text
+    assert "AKIATESTKEY" not in text
+
+
+@mock_aws
+def test_list_page_shows_requested_slice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import boto3
+
+    point_paths(monkeypatch, tmp_path)
+    fill_env(monkeypatch)
+    client = boto3.client("s3", region_name="us-east-1")
+    client.create_bucket(Bucket="recordings")
+    for name, body in (("a", b"aa"), ("b", b"bbb"), ("c", b"cccc"), ("d", b"d"), ("e", b"ee")):
+        client.put_object(Bucket="recordings", Key=f"records/{name}.wav", Body=body)
+    client.put_object(Bucket="recordings", Key="other/skip.wav", Body=b"no")
+
+    def fail_lock(path: Path) -> bool:
+        raise AssertionError(path)
+
+    monkeypatch.setattr("app.main.acquire_lock", fail_lock)
+    code = main(["--list", "--limit", "2", "--page", "2"])
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert code == 0, text
+    assert "страница=2" in text
+    assert "размер_страницы=2" in text
+    assert "показано=2" in text
+    assert "есть_далее=1" in text
+    assert "key=records/c.wav" in text
+    assert "key=records/d.wav" in text
+    assert "key=records/a.wav" not in text
+    assert "key=records/e.wav" not in text
+    assert "key=other/skip.wav" not in text
+
+
+@mock_aws
+def test_list_defaults_and_download_saves_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import boto3
+
+    point_paths(monkeypatch, tmp_path)
+    fill_env(monkeypatch)
+    client = boto3.client("s3", region_name="us-east-1")
+    client.create_bucket(Bucket="recordings")
+    client.put_object(Bucket="recordings", Key="records/call.wav", Body=b"audio-bytes")
+    list_code = main(["--list"])
+    list_text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert list_code == 0, list_text
+    assert "страница=1" in list_text
+    assert "размер_страницы=20" in list_text
+    assert "показано=1" in list_text
+    assert "есть_далее=0" in list_text
+
+    code = main(["--download", "records/call.wav"])
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    saved = tmp_path / "download" / "records" / "call.wav"
+    assert code == 0, text
+    assert saved.read_bytes() == b"audio-bytes"
+    assert "файл сохранён" in text
+    assert "./download/records/call.wav" in text
+    assert "secret-test-value" not in text
+
+
+@mock_aws
+def test_download_missing_and_unsafe_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import boto3
+
+    point_paths(monkeypatch, tmp_path)
+    fill_env(monkeypatch)
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="recordings")
+    assert main(["--download", "records/missing.wav"]) == 1
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert "объект не найден" in text
+    assert main(["--download", "../secret.wav"]) == 1
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert "недопустимый ключ" in text
+    assert not (tmp_path / "download").exists() or not any((tmp_path / "download").rglob("*"))
+
+
+def test_list_usage_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--list", "--count"]) == 1
+    assert "--list" in capsys.readouterr().err
+    assert main(["--list", "--page", "0"]) == 1
+    assert "--page" in capsys.readouterr().err
+    assert main(["--page", "2"]) == 1
+    assert "--list" in capsys.readouterr().err
+
+
+def test_count_error_is_scrubbed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    point_paths(monkeypatch, tmp_path)
+    fill_env(monkeypatch)
+
+    def fail_client(settings: object) -> None:
+        raise RuntimeError("secret-test-value failed")
+
+    monkeypatch.setattr("app.main.create_s3_client", fail_client)
+    assert main(["--count"]) == 1
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert "не удалось посчитать объекты" in text
+    assert "secret-test-value" not in text
+    assert "***" in text
 
 
 @mock_aws

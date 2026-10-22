@@ -97,6 +97,35 @@ docker compose stop archiver
 
 ## 5. Журнал, состояние, остановка, обновление
 
+Число объектов в бакете по префиксу `S3_PREFIX`. Команда ничего не загружает и не удаляет, lock не занимает, останавливать сервис не нужно:
+
+```bash
+docker compose run --rm archiver python -m app.main --count
+```
+
+В журнале будет строка `объекты в бакете` с числом объектов и суммарным размером. Код выхода `1` значит, что список прочитать не удалось.
+
+Страница объектов по тому же префиксу. По умолчанию 20 объектов и страница 1:
+
+```bash
+docker compose run --rm archiver python -m app.main --list
+docker compose run --rm archiver python -m app.main --list --limit 20 --page 2
+```
+
+Строка `список` показывает, сколько объектов выведено и есть ли следующая страница. У каждого объекта в журнале есть `key` и `size`. `есть_далее=1` значит, что за этой страницей есть ещё объекты.
+
+Скачать один объект в папку `download` проекта. Ключ берётся из колонки `key` списка:
+
+```bash
+docker compose run --rm archiver python -m app.main --download records/file.wav
+```
+
+Файл появится в `./download` с тем же путём, что у ключа. Если каталог создался от root и запись не удалась, отдайте его пользователю из `.env`:
+
+```bash
+docker compose run --rm --user 0:0 --entrypoint python archiver -c "import os; path='/data/download'; os.makedirs(path, exist_ok=True); os.chown(path, int(os.environ['PUID']), int(os.environ['PGID'])); os.chmod(path, 0o775); print('ok', os.environ['PUID'], os.environ['PGID'])"
+```
+
 Журнал контейнера:
 
 ```bash

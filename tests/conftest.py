@@ -75,6 +75,7 @@ def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
         "delete_after_upload": True,
         "dry_run": False,
         "log_level": "INFO",
+        "download_dir": tmp_path / "download",
     }
     values.update(overrides)
     return Settings(**values)

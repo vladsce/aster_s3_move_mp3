@@ -6,5 +6,6 @@ __pycache__
 *.pyc
 .venv
 records
+download
 *.mp3
 *.wav

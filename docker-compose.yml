@@ -26,6 +26,10 @@ services:
         source: ${HOST_LOGS_DIR:-./logs}
         target: /var/log/archiver
         read_only: false
+      - type: bind
+        source: ./download
+        target: /data/download
+        read_only: false
     stop_grace_period: 60s
     healthcheck:
       test:

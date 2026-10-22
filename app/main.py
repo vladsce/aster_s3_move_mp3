@@ -17,7 +17,14 @@ from typing import IO, Any
 
 from app.config import ConfigError, Settings, load_settings, log_event
 from app.scanner import find_candidates
-from app.uploader import create_s3_client, process_file, safe_error
+from app.uploader import (
+    count_objects,
+    create_s3_client,
+    download_object,
+    list_object_page,
+    process_file,
+    safe_error,
+)
 
 _stop = threading.Event()
 _signal_number: int | None = None
@@ -232,7 +239,54 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="только журнал, без загрузки и без удаления",
     )
+    parser.add_argument(
+        "--count",
+        action="store_true",
+        help="посчитать объекты в бакете по S3_PREFIX и выйти",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="показать страницу объектов по S3_PREFIX и выйти",
+    )
+    parser.add_argument("--page", type=int, default=None, help="номер страницы списка, с 1")
+    parser.add_argument("--limit", type=int, default=None, help="сколько объектов на странице")
+    parser.add_argument(
+        "--download",
+        metavar="KEY",
+        help="скачать объект в каталог download и выйти",
+    )
     return parser.parse_args(argv)
+
+
+def validate_cli(args: argparse.Namespace) -> str | None:
+    """Проверяет, что разовая команда одна и страница списка задана корректно."""
+    chosen = [
+        name
+        for name, enabled in (
+            ("--count", args.count),
+            ("--list", args.list),
+            ("--download", bool(args.download)),
+            ("--once", args.once),
+        )
+        if enabled
+    ]
+    lookups = [name for name in chosen if name != "--once"]
+    if len(lookups) > 1 or (args.once and lookups):
+        return "Укажите одну команду: обычный запуск, --once, --count, --list или --download"
+    if args.dry_run and lookups:
+        return "--dry-run используется для прохода по локальным файлам"
+    if (args.page is not None or args.limit is not None) and not args.list:
+        return "--page и --limit задаются вместе с --list"
+    if not args.list:
+        return None
+    page = 1 if args.page is None else args.page
+    limit = 20 if args.limit is None else args.limit
+    if page < 1 or limit < 1:
+        return "--page и --limit должны быть целыми числами от 1"
+    args.page = page
+    args.limit = limit
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -241,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
     _stop.clear()
     _signal_number = None
     args = parse_args(argv)
+    usage_error = validate_cli(args)
+    if usage_error:
+        print(usage_error, file=sys.stderr)
+        return 1
     try:
         settings = load_settings()
     except ConfigError as exc:
@@ -259,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if args.count:
+        return _count_bucket(settings)
+    if args.list:
+        return _list_bucket(settings, page=args.page, limit=args.limit)
+    if args.download:
+        return _download_key(settings, args.download)
 
     try:
         locked = acquire_lock(settings.lock_path)
@@ -288,6 +353,95 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         restore_signals(saved_signals)
         release_lock()
+
+
+def _count_bucket(settings: Settings) -> int:
+    """Один запрос списка объектов. Ничего не загружает и не занимает lock."""
+    try:
+        client = create_s3_client(settings)
+        objects, total = count_objects(client, settings.s3_bucket, settings.s3_prefix)
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            f"не удалось посчитать объекты: {safe_error(exc, settings)}",
+        )
+        return 1
+    log_event(
+        logging.INFO,
+        "объекты в бакете: "
+        f"бакет={settings.s3_bucket} префикс={settings.s3_prefix!r} "
+        f"объектов={objects} байт={total}",
+    )
+    return 0
+
+
+def _list_bucket(settings: Settings, *, page: int, limit: int) -> int:
+    """Одна страница списка. Ничего не загружает и не занимает lock."""
+    try:
+        client = create_s3_client(settings)
+        items, has_next = list_object_page(
+            client,
+            settings.s3_bucket,
+            settings.s3_prefix,
+            limit=limit,
+            page=page,
+        )
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            f"не удалось получить список: {safe_error(exc, settings)}",
+        )
+        return 1
+    log_event(
+        logging.INFO,
+        "список: "
+        f"страница={page} размер_страницы={limit} показано={len(items)} "
+        f"есть_далее={int(has_next)} префикс={settings.s3_prefix!r}",
+    )
+    for key, size in items:
+        log_event(logging.INFO, "объект", key=key, size=size)
+    return 0
+
+
+def _download_key(settings: Settings, key: str) -> int:
+    """Скачивает один объект в каталог download. Ничего не удаляет и не занимает lock."""
+    try:
+        client = create_s3_client(settings)
+        destination, size = download_object(
+            client,
+            settings.s3_bucket,
+            key,
+            settings.download_dir,
+        )
+    except FileNotFoundError:
+        log_event(logging.ERROR, "объект не найден", key=key)
+        return 1
+    except ValueError as exc:
+        log_event(logging.ERROR, str(exc), key=key)
+        return 1
+    except OSError as exc:
+        log_event(
+            logging.ERROR,
+            f"не удалось сохранить файл: {exc}. "
+            "Каталог download должен быть доступен на запись пользователю контейнера.",
+            key=key,
+        )
+        return 1
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            f"не удалось скачать объект: {safe_error(exc, settings)}",
+            key=key,
+        )
+        return 1
+    relative = destination.relative_to(settings.download_dir).as_posix()
+    log_event(
+        logging.INFO,
+        f"файл сохранён: {destination}. В каталоге проекта это ./download/{relative}",
+        key=key,
+        size=size,
+    )
+    return 0
 
 
 def _run_once(settings: Settings) -> int:

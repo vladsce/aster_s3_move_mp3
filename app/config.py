@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 SRC_DIR = Path("/data/records")
+DOWNLOAD_DIR = Path("/data/download")
 LOG_FILE = Path("/var/log/archiver/archiver.log")
 HEARTBEAT_PATH = Path("/tmp/heartbeat")
 LOCK_PATH = Path("/var/log/archiver/.lock")
@@ -48,6 +49,7 @@ class Settings:
     delete_after_upload: bool
     dry_run: bool
     log_level: str
+    download_dir: Path = Path("/data/download")
 
     def safe_summary(self) -> str:
         """Описание настроек для журнала без ключей доступа."""
@@ -57,7 +59,7 @@ class Settings:
             f"prefix={self.s3_prefix!r} age_months={self.age_months} "
             f"interval={self.check_interval_seconds}s extensions={','.join(self.extensions)} "
             f"delete_after_upload={self.delete_after_upload} dry_run={self.dry_run} "
-            f"log_level={self.log_level}"
+            f"log_level={self.log_level} download={self.download_dir}"
         )
 
     def scrub(self, text: str) -> str:
@@ -194,6 +196,7 @@ def settings_from_mapping(env: Mapping[str, str]) -> Settings:
         delete_after_upload=delete_after_upload,
         dry_run=dry_run,
         log_level=level,
+        download_dir=DOWNLOAD_DIR,
     )
 
 

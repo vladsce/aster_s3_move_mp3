@@ -23,9 +23,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /app /data/records /var/log/archiver \
-    && chown -R "${PUID}:${PGID}" /app /data/records /var/log/archiver \
-    && chmod 1777 /var/log/archiver
+    && mkdir -p /app /data/records /data/download /var/log/archiver \
+    && chown -R "${PUID}:${PGID}" /app /data/records /data/download /var/log/archiver \
+    && chmod 1777 /var/log/archiver /data/download
 
 WORKDIR /app
 

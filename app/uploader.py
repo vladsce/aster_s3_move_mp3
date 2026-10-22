@@ -117,6 +117,85 @@ def is_not_found(exc: ClientError) -> bool:
     return code in {"404", "NoSuchKey", "NotFound"} or status == 404
 
 
+def count_objects(client: Any, bucket: str, prefix: str) -> tuple[int, int]:
+    """Число объектов и их суммарный размер. Пустой префикс считает весь бакет."""
+    count = 0
+    total = 0
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            count += 1
+            total += int(obj.get("Size", 0))
+    return count, total
+
+
+def list_object_page(
+    client: Any,
+    bucket: str,
+    prefix: str,
+    *,
+    limit: int,
+    page: int,
+) -> tuple[list[tuple[str, int]], bool]:
+    """Страница объектов по префиксу и признак, что следующая страница не пустая."""
+    skip = (page - 1) * limit
+    selected: list[tuple[str, int]] = []
+    seen = 0
+    paginator = client.get_paginator("list_objects_v2")
+    for batch in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in batch.get("Contents", []):
+            if seen < skip:
+                seen += 1
+                continue
+            if len(selected) >= limit:
+                return selected, True
+            selected.append((str(obj["Key"]), int(obj.get("Size", 0))))
+            seen += 1
+    return selected, False
+
+
+def object_download_path(root: Path, key: str) -> Path:
+    """Путь внутри каталога скачивания. Ключ с `..` или пустой ключ отклоняется."""
+    cleaned = key.strip().replace("\\", "/").lstrip("/")
+    parts = [part for part in cleaned.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"недопустимый ключ: {key}")
+    return root.joinpath(*parts)
+
+
+def download_object(client: Any, bucket: str, key: str, root: Path) -> tuple[Path, int]:
+    """Скачивает объект одним GetObject во временный файл и заменяет им назначение."""
+    destination = object_download_path(root, key)
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if is_not_found(exc):
+            raise FileNotFoundError(key) from exc
+        raise
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".part")
+    expected = int(response.get("ContentLength", -1))
+    size = 0
+    try:
+        with temporary.open("wb") as handle:
+            body = response["Body"]
+            while True:
+                chunk = body.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                size += len(chunk)
+        if expected >= 0 and size != expected:
+            raise VerificationError(
+                f"скачанный размер {size} не совпал с размером объекта {expected}"
+            )
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination, size
+
+
 def head_if_exists(client: Any, bucket: str, key: str) -> dict[str, Any] | None:
     """Возвращает ответ Head Object или None, если ключа нет."""
     try:
