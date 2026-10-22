@@ -1,0 +1,63 @@
+name: s3-archiver
+
+services:
+  archiver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        PUID: ${PUID:-1000}
+        PGID: ${PGID:-1000}
+    image: s3-archiver:runtime
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: ${TZ:-Europe/Chisinau}
+    user: "${PUID:-1000}:${PGID:-1000}"
+    volumes:
+      - type: bind
+        source: ${HOST_RECORDS_DIR:-./records}
+        target: /data/records
+        read_only: false
+      - type: bind
+        source: ${HOST_LOGS_DIR:-./logs}
+        target: /var/log/archiver
+        read_only: false
+    stop_grace_period: 60s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - from app.config import heartbeat_is_fresh; import sys; sys.exit(0 if heartbeat_is_fresh() else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+      args:
+        PUID: ${PUID:-1000}
+        PGID: ${PGID:-1000}
+    image: s3-archiver:test
+    environment:
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      MOTO_S3_CUSTOM_ENDPOINTS: https://s3.test.local
+    working_dir: /app
+    command: ["pytest", "-q"]

@@ -1,0 +1,4 @@
+# boto3 1.36+ принимает request_checksum_calculation и response_checksum_validation.
+boto3>=1.36.0
+python-dotenv>=1.0.1
+python-dateutil>=2.9.0
