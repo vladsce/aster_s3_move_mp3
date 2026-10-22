@@ -20,6 +20,16 @@ def test_age_boundary_uses_relativedelta() -> None:
     assert is_old_enough(cutoff - timedelta(seconds=1), NOW, 3) is True
 
 
+def test_zero_months_skips_age_check(tmp_path: Path) -> None:
+    assert is_old_enough(NOW, NOW, 0) is True
+    assert is_old_enough(NOW + timedelta(days=1), NOW, 0) is True
+    src = tmp_path / "records"
+    src.mkdir()
+    fresh = place_file(src, "fresh.mp3", b"new", NOW)
+    found = find_candidates(src, extensions={".mp3"}, age_months=0, now=NOW)
+    assert [item.path for item in found] == [fresh]
+
+
 def test_selects_old_mp3_and_skips_fresh_other_and_links(tmp_path: Path) -> None:
     src = tmp_path / "records"
     src.mkdir()

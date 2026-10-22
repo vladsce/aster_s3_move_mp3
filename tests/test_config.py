@@ -26,6 +26,13 @@ def valid_env() -> dict[str, str]:
     }
 
 
+def test_zero_age_months_is_allowed() -> None:
+    env = valid_env()
+    env["AGE_MONTHS"] = "0"
+    settings = settings_from_mapping(env)
+    assert settings.age_months == 0
+
+
 def test_defaults_and_secret_are_not_in_repr() -> None:
     settings = settings_from_mapping(valid_env())
     assert settings.src_dir == SRC_DIR

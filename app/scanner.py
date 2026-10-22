@@ -22,7 +22,9 @@ class Candidate:
 
 
 def is_old_enough(mtime: datetime, now: datetime, age_months: int) -> bool:
-    """Файл старше порога, посчитанного через relativedelta от текущего времени."""
+    """Файл старше порога. Ноль месяцев отключает проверку возраста."""
+    if age_months == 0:
+        return True
     cutoff = now - relativedelta(months=age_months)
     return mtime < cutoff
 
