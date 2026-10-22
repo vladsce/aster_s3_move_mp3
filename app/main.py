@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import IO, Any
 
@@ -29,6 +29,9 @@ from app.uploader import (
 _stop = threading.Event()
 _signal_number: int | None = None
 _lock_handle: IO[str] | None = None
+_BACKOFF_AFTER_ERRORS = 10
+_BACKOFF_FIRST_SECONDS = 30
+_BACKOFF_MAX_SECONDS = 4 * 60 * 60
 
 
 @dataclass
@@ -42,6 +45,7 @@ class PassStats:
     errors: int = 0
     bytes_uploaded: int = 0
     bytes_planned: int = 0
+    consecutive_errors: int = 0
 
 
 def _close_handlers(logger: logging.Logger) -> None:
@@ -51,7 +55,7 @@ def _close_handlers(logger: logging.Logger) -> None:
 
 
 def setup_logging(log_file: Path, level: str) -> None:
-    """Журнал в файл с ротацией 10 МБ × 5 и копия в stdout."""
+    """Журнал в файл: один файл в сутки, не больше 10 файлов, и копия в stdout."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("archiver")
     _close_handlers(logger)
@@ -62,10 +66,11 @@ def setup_logging(log_file: Path, level: str) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         defaults={"file_path": "-", "s3_key": "-", "size": "-"},
     )
-    file_handler = RotatingFileHandler(
+    file_handler = TimedRotatingFileHandler(
         log_file,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        when="midnight",
+        interval=1,
+        backupCount=9,
         encoding="utf-8",
     )
     stream_handler = logging.StreamHandler(sys.stdout)
@@ -131,14 +136,47 @@ def _handle_signal(signum: int, _frame: object) -> None:
     _stop.set()
 
 
-def sleep_until_stop(seconds: int) -> None:
+def pause_after_errors(base_seconds: int, consecutive_errors: int) -> int:
+    """Пауза после серии ошибок. 10 подряд дают 30 с, дальше удвоение, потолок 4 часа.
+
+    Короче заданного CHECK_INTERVAL_SECONDS пауза не становится.
+    """
+    if consecutive_errors < _BACKOFF_AFTER_ERRORS:
+        return base_seconds
+    steps = consecutive_errors // _BACKOFF_AFTER_ERRORS
+    slowed = _BACKOFF_FIRST_SECONDS
+    for _ in range(steps - 1):
+        if slowed >= _BACKOFF_MAX_SECONDS:
+            break
+        slowed = min(_BACKOFF_MAX_SECONDS, slowed * 2)
+    return max(base_seconds, min(_BACKOFF_MAX_SECONDS, slowed))
+
+
+def sleep_until_stop(
+    seconds: int,
+    *,
+    heartbeat: Path | None = None,
+    beat_every: int = 0,
+) -> None:
     """Пауза, которая заканчивается раньше, если пришёл сигнал остановки."""
     deadline = time.monotonic() + seconds
+    next_beat = time.monotonic() + beat_every if heartbeat is not None and beat_every > 0 else None
     while not _stop.is_set():
+        if next_beat is not None and time.monotonic() >= next_beat:
+            try:
+                touch_heartbeat(heartbeat)
+            except OSError as exc:
+                log_event(logging.ERROR, f"не удалось обновить heartbeat: {exc}")
+            next_beat = time.monotonic() + beat_every
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
-        time.sleep(min(1.0, remaining))
+        step = min(1.0, remaining)
+        if next_beat is not None:
+            step = min(step, max(0.0, next_beat - time.monotonic()))
+        if step <= 0:
+            continue
+        time.sleep(step)
 
 
 def run_pass(
@@ -146,10 +184,11 @@ def run_pass(
     client: Any,
     *,
     now: datetime | None = None,
+    streak: int = 0,
 ) -> PassStats:
     """Один проход: найти, загрузить, проверить, удалить локальные копии, записать итог."""
     moment = now if now is not None else datetime.now(timezone.utc)
-    stats = PassStats()
+    stats = PassStats(consecutive_errors=streak)
     try:
         _execute_pass(settings, client, moment, stats)
     finally:
@@ -188,6 +227,7 @@ def _execute_pass(
             outcome = process_file(settings, client, candidate.path, now=moment)
         except Exception as exc:
             stats.errors += 1
+            stats.consecutive_errors += 1
             log_event(
                 logging.ERROR,
                 f"ошибка обработки: {safe_error(exc, settings)}",
@@ -198,10 +238,12 @@ def _execute_pass(
         if outcome.status == "uploaded":
             stats.uploaded += 1
             stats.bytes_uploaded += outcome.size
+            stats.consecutive_errors = 0
         elif outcome.status == "skipped":
             stats.skipped += 1
         elif outcome.status == "error":
             stats.errors += 1
+            stats.consecutive_errors += 1
         if outcome.deleted:
             stats.deleted += 1
         if outcome.delete_failed:
@@ -456,22 +498,46 @@ def _run_once(settings: Settings) -> int:
     return 1 if stats.errors else 0
 
 
+def _sleep_for_streak(settings: Settings, streak: int, previous_pause: int) -> int:
+    """Ждёт следующую проверку. Во время длинной паузы обновляет heartbeat."""
+    pause = pause_after_errors(settings.check_interval_seconds, streak)
+    if pause != previous_pause:
+        if pause == settings.check_interval_seconds:
+            log_event(logging.INFO, f"пауза снова {pause}с")
+        else:
+            log_event(
+                logging.INFO,
+                f"пауза увеличена: ошибок_подряд={streak} пауза={pause}с",
+            )
+    sleep_until_stop(
+        pause,
+        heartbeat=settings.heartbeat_path,
+        beat_every=settings.check_interval_seconds,
+    )
+    return pause
+
+
 def _run_forever(settings: Settings) -> int:
     client: Any | None = None
+    streak = 0
+    pause = settings.check_interval_seconds
     while not _stop.is_set():
         if client is None:
             try:
                 client = create_s3_client(settings)
             except Exception as exc:
+                streak += 1
                 log_event(
                     logging.ERROR,
                     f"не удалось создать клиент S3: {safe_error(exc, settings)}",
                 )
-                sleep_until_stop(settings.check_interval_seconds)
+                pause = _sleep_for_streak(settings, streak, pause)
                 continue
         try:
-            run_pass(settings, client)
+            stats = run_pass(settings, client, streak=streak)
+            streak = stats.consecutive_errors
         except Exception as exc:
+            streak += 1
             log_event(logging.ERROR, f"проход не выполнен: {safe_error(exc, settings)}")
             try:
                 touch_heartbeat(settings.heartbeat_path)
@@ -479,7 +545,7 @@ def _run_forever(settings: Settings) -> int:
                 pass
         if _stop.is_set():
             break
-        sleep_until_stop(settings.check_interval_seconds)
+        pause = _sleep_for_streak(settings, streak, pause)
     return 0
 
 

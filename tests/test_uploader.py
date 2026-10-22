@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import pytest
@@ -189,10 +189,11 @@ def test_library_loggers_stay_quiet_and_file_rotates(tmp_path: Path) -> None:
     handlers = [
         handler
         for handler in logging.getLogger("archiver").handlers
-        if isinstance(handler, RotatingFileHandler)
+        if isinstance(handler, TimedRotatingFileHandler)
     ]
-    assert handlers[0].maxBytes == 10 * 1024 * 1024
-    assert handlers[0].backupCount == 5
+    assert handlers[0].when == "MIDNIGHT"
+    assert handlers[0].backupCount == 9
+    assert handlers[0].interval == 24 * 60 * 60
 
 
 @mock_aws

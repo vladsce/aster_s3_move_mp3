@@ -20,6 +20,7 @@ from app.main import (
     _stop,
     acquire_lock,
     main,
+    pause_after_errors,
     run_pass,
     setup_logging,
 )
@@ -169,12 +170,59 @@ def test_once_returns_error_when_pass_failed(
     assert main(["--once"]) == 1
 
 
+def test_pause_grows_by_tens_and_caps_at_four_hours() -> None:
+    assert pause_after_errors(1, 0) == 1
+    assert pause_after_errors(1, 9) == 1
+    assert pause_after_errors(1, 10) == 30
+    assert pause_after_errors(1, 19) == 30
+    assert pause_after_errors(1, 20) == 60
+    assert pause_after_errors(1, 30) == 120
+    assert pause_after_errors(300, 10) == 300
+    assert pause_after_errors(300, 50) == 480
+    assert pause_after_errors(1, 10_000) == 4 * 60 * 60
+
+
+def test_daemon_slows_after_error_streak_and_resets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    point_paths(monkeypatch, tmp_path)
+    fill_env(monkeypatch, CHECK_INTERVAL_SECONDS="1")
+    sleeps: list[int] = []
+    passes = {"n": 0}
+
+    def fake_pass(settings: object, client: object, now: object = None, streak: int = 0) -> PassStats:
+        passes["n"] += 1
+        if passes["n"] == 1:
+            return PassStats(errors=10, consecutive_errors=streak + 10)
+        return PassStats(uploaded=1, consecutive_errors=0)
+
+    def fake_sleep(seconds: int, heartbeat: object = None, beat_every: int = 0) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            _stop.set()
+
+    monkeypatch.setattr("app.main.run_pass", fake_pass)
+    monkeypatch.setattr("app.main.sleep_until_stop", fake_sleep)
+    monkeypatch.setattr("app.main.create_s3_client", lambda settings: object())
+    assert main([]) == 0
+    assert sleeps == [30, 1]
+    text = (tmp_path / "archiver.log").read_text(encoding="utf-8")
+    assert "пауза увеличена: ошибок_подряд=10 пауза=30с" in text
+    assert "пауза снова 1с" in text
+
+
 def test_daemon_stops_after_current_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     point_paths(monkeypatch, tmp_path)
     fill_env(monkeypatch)
     calls = {"n": 0}
 
-    def fake_pass(settings: object, client: object, now: object = None) -> PassStats:
+    def fake_pass(
+        settings: object,
+        client: object,
+        now: object = None,
+        streak: int = 0,
+    ) -> PassStats:
         calls["n"] += 1
         _stop.set()
         return PassStats()
